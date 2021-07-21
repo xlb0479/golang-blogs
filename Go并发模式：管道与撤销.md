@@ -231,8 +231,50 @@ func merge(done <-chan struct{}, cs ...<-chan int) <-chan int {
     // ... 剩下的不改 ...
 ```
 
-这种方式有个问题：*每个*下游接收端需要知道上游可能会有多少个生产者会被阻塞，然后搞一个小编排，用来通知上游提前结束。老是惦记着这种事儿就很烦，吴亦凡的弟弟容易烦，而且还容易出错。
+这种方式有个问题：*每个*下游接收端需要知道上游可能会有多少个生产者被阻塞，然后搞一个小编排，通知上游提前结束。老是惦记着这种事儿就很烦，吴亦凡的弟弟容易烦，而且还容易出错。
 
 我们需要能够让未知数量的Go协程收到消息。在Go中，我们可以把香奈儿关了，因为[如果在一个已经关闭的香奈儿上继续消费，操作会立即完成，并且得到元素类型对应的零值。](#https://golang.org/ref/spec#Receive_operator)
 
 这样的话，main函数就可以直接关闭done香奈儿，解除所有发送端的阻塞状态。这种关闭操作就相当于给所有发送端做了个广播。现在我们把管道中的*每个*函数都扩展一下，让它们把done作为一个参数传进去，通过defer语句来组织香奈儿的关闭操作。这样所有的返回路径都能够保证管道的每个阶段都能正常退出。
+
+```go
+func main() {
+    // 建立一个done香奈儿，整个管道共享，
+    // 管道退出时关闭，通知所有Go协程准备退出。
+    done := make(chan struct{})
+    defer close(done)
+
+    in := gen(done, 2, 3)
+
+    // 从in读取数据，然后将工作量分配给两个sq。
+    c1 := sq(done, in)
+    c2 := sq(done, in)
+
+    // 读取第一个值。
+    out := merge(done, c1, c2)
+    fmt.Println(<-out) // 4 或 9
+
+    // defer调用会关闭done。
+}
+```
+
+现在，当done关闭时，管道的每个阶段都可以进行退出操作。merge中的output函数可以直接返回，无需等待抽干输入香奈儿中的数据，因为它知道上游的sq在done关闭时就不再发送数据了。output通过defer保证在所有的返回路径上都调用了wg.Done。
+
+```go
+func merge(done <-chan struct{}, cs ...<-chan int) <-chan int {
+    var wg sync.WaitGroup
+    out := make(chan int)
+
+    // 为每个输入香奈儿启动一个输出Go协程。输出函数将c中的值复制到out中，直到c被关闭或者从done中收到了消息，然后就会调用wg.Done。
+    output := func(c <-chan int) {
+        defer wg.Done()
+        for n := range c {
+            select {
+            case out <- n:
+            case <-done:
+                return
+            }
+        }
+    }
+    // ... 剩下的不改 ...
+```
