@@ -278,3 +278,103 @@ func merge(done <-chan struct{}, cs ...<-chan int) <-chan int {
     }
     // ... 剩下的不改 ...
 ```
+
+同样，sq也可以在done关闭时做出回应。sq也是通过defer语句保证在所有的返回路径上都能顺利关闭out香奈儿：
+
+```go
+func sq(done <-chan struct{}, in <-chan int) <-chan int {
+    out := make(chan int)
+    go func() {
+        defer close(out)
+        for n := range in {
+            select {
+            case out <- n * n:
+            case <-done:
+                return
+            }
+        }
+    }()
+    return out
+}
+```
+
+这里给出一些构建管道的指导方针：
+
+- 当前阶段完成所有发送操作后要关闭输出香奈儿。
+- 当前阶段从输入香奈儿中读取数据，直到香奈儿被关闭，或者发送端非阻塞。
+
+如果管道中的发送端非阻塞，要么就确保有足够的缓冲来接收数据，要么就是在消费端丢弃香奈儿时主动通知发送端。
+
+## 树摘要
+
+来搞一个更现实的管道。
+
+MD5是一个消息摘要算法，可以用于文件校验码。系统自带的md5sum命令可以输出一组文件的摘要值。
+
+```shell
+% md5sum *.go
+d47c2bbc28298ca9befdfbc5d3aa4e65  bounded.go
+ee869afd31f83cbb2d10ee81b2b831dc  parallel.go
+b88175e65fdcbc01ac08aaf1fd9b5e96  serial.go
+```
+
+现在我们要自己搞一个md5sum程序，我们要的参数是一个目录，然后输出目录中每个文件的摘要，按文件名排序。
+
+```shell
+% go run serial.go .
+d47c2bbc28298ca9befdfbc5d3aa4e65  bounded.go
+ee869afd31f83cbb2d10ee81b2b831dc  parallel.go
+b88175e65fdcbc01ac08aaf1fd9b5e96  serial.go
+```
+
+我们的主函数调用一个辅助函数MD5All，它会返回一个从路径名到摘要值的map，然后我们做排序并输出结果：
+
+```go
+func main() {
+    // 计算指定文件夹内所有文件的MD5值，
+    // 然后输出按路径名排序后的结果。
+    m, err := MD5All(os.Args[1])
+    if err != nil {
+        fmt.Println(err)
+        return
+    }
+    var paths []string
+    for path := range m {
+        paths = append(paths, path)
+    }
+    sort.Strings(paths)
+    for _, path := range paths {
+        fmt.Printf("%x  %s\n", m[path], path)
+    }
+}
+```
+
+我们主要就是研究下MD5All这个函数。在[serial.go](#https://blog.golang.org/pipelines/serial.go)中，没有用并发实现，只不过就是一个遍历、读取然后计算的过程。
+
+```go
+// MD5All以root为根目录读取整棵文件树，返沪从文件路径到MD5值的map。如果遍历出现问题，或者读取文件异常，MD5All就返回一个error。
+func MD5All(root string) (map[string][md5.Size]byte, error) {
+    m := make(map[string][md5.Size]byte)
+    err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+        if err != nil {
+            return err
+        }
+        if !info.Mode().IsRegular() {
+            return nil
+        }
+        data, err := ioutil.ReadFile(path)
+        if err != nil {
+            return err
+        }
+        m[path] = md5.Sum(data)
+        return nil
+    })
+    if err != nil {
+        return nil, err
+    }
+    return m, nil
+}
+```
+
+## 并行摘要计算
+
