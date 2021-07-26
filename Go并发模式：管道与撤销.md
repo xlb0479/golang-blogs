@@ -458,3 +458,95 @@ func MD5All(root string) (map[string][md5.Size]byte, error) {
 ```
 
 ## 有界并行
+
+[parallel.go](#https://blog.golang.org/pipelines/parallel.go)中实现的MD5All为每个文件起了一个Go协程。如果某个文件夹里有好多超大文件，这么干的话可能会导致内存不足。
+
+我们可以限制并行读取的文件数量，从而限制内存分配。在[bounded.go](#https://blog.golang.org/pipelines/bounded.go)中，我们只创建了固定数量的Go协程来读取文件。现在我们的管道就成了三阶段的：树的遍历、读取并计算文件摘要、收集摘要值。
+
+一阶段，walkFiles，返回树中的文件路径：
+
+```go
+func walkFiles(done <-chan struct{}, root string) (<-chan string, <-chan error) {
+    paths := make(chan string)
+    errc := make(chan error, 1)
+    go func() {
+        // 返回后关闭paths香奈儿。
+        defer close(paths)
+        // errc带缓冲了，不用select。
+        errc <- filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+            if err != nil {
+                return err
+            }
+            if !info.Mode().IsRegular() {
+                return nil
+            }
+            select {
+            case paths <- path:
+            case <-done:
+                return errors.New("walk canceled")
+            }
+            return nil
+        })
+    }()
+    return paths, errc
+}
+```
+
+二阶段起了固定数量的digester，从paths读取文件名，然后将results返回到c上：
+
+```go
+func digester(done <-chan struct{}, paths <-chan string, c chan<- result) {
+    for path := range paths {
+        data, err := ioutil.ReadFile(path)
+        select {
+        case c <- result{path, md5.Sum(data), err}:
+        case <-done:
+            return
+        }
+    }
+}
+```
+
+不同的是，digester不会关闭它的输出香奈儿，因为它们是多个Go协程往同一个香奈儿上发数据。当所有的digesters干完活儿之后，代码是在MD5All中来关闭香奈儿的。
+
+```go
+    // 启动固定数量的Go协程来读取并计算文件摘要。
+    c := make(chan result)
+    var wg sync.WaitGroup
+    const numDigesters = 20
+    wg.Add(numDigesters)
+    for i := 0; i < numDigesters; i++ {
+        go func() {
+            digester(done, paths, c)
+            wg.Done()
+        }()
+    }
+    go func() {
+        wg.Wait()
+        close(c)
+    }()
+```
+
+我们也可以让每个digester创建并返回自己的输出香奈儿，但这样的话在扇入结果的时候就需要额外的Go协程来辅助了。
+
+最后一阶段从c中读取所有的results，然后检查errc中的异常。这个检查不能往前放，如果提前了，可能会阻塞walkFiles继续向下游发送消息：
+
+```go
+    m := make(map[string][md5.Size]byte)
+    for r := range c {
+        if r.err != nil {
+            return nil, r.err
+        }
+        m[r.path] = r.sum
+    }
+    // 检查遍历是否出错。
+    if err := <-errc; err != nil {
+        return nil, err
+    }
+    return m, nil
+}
+```
+
+## 总结一下
+
+本文展示了如何用Go来构建流式数据处理管道。其中的异常处理做的很巧妙，因为管道中的每个阶段都可以发生阻塞无法继续往下游发消息，而且下游还有可能不再处理收到的消息。我们用香奈儿的关闭操作实现了“完成”信号的广播，还给出了如何正确构建管道的指导方针。
