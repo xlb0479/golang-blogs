@@ -378,3 +378,83 @@ func MD5All(root string) (map[string][md5.Size]byte, error) {
 
 ## 并行摘要计算
 
+我们在[parallel.go](#https://blog.golang.org/pipelines/parallel.go)种把MD5All改成了一个两阶段的管道。一阶段是sumFiles，负责树的遍历，计算每个文件的摘要时启动一个新的Go协程，并将结果发送到一个香奈儿中，其元素类型为result：
+
+```go
+type result struct {
+    path string
+    sum  [md5.Size]byte
+    err  error
+}
+```
+
+sumFiles返回两个香奈儿：一个是放result的，另一个放filepath.Walk返回的错误信息。遍历函数为每个文件创建一个Go协程来处理，然后会检查done。如果done关了，遍历立即结束：
+
+```go
+func sumFiles(done <-chan struct{}, root string) (<-chan result, <-chan error) {
+    // 为每个文件启动一个Go协程来进行计算并将结果返回给c。将遍历结果发送到errc。
+    c := make(chan result)
+    errc := make(chan error, 1)
+    go func() {
+        var wg sync.WaitGroup
+        err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+            if err != nil {
+                return err
+            }
+            if !info.Mode().IsRegular() {
+                return nil
+            }
+            wg.Add(1)
+            go func() {
+                data, err := ioutil.ReadFile(path)
+                select {
+                case c <- result{path, md5.Sum(data), err}:
+                case <-done:
+                }
+                wg.Done()
+            }()
+            // 如果done关了就结束。
+            select {
+            case <-done:
+                return errors.New("walk canceled")
+            default:
+                return nil
+            }
+        })
+        // 遍历结束，所有的wg.Add都已执行完成。启动一个Go协程，所有发送任务完成后，启动Go协程来关闭c。
+        go func() {
+            wg.Wait()
+            close(c)
+        }()
+        // 这里不用select，因为errc是带缓冲的。
+        errc <- err
+    }()
+    return c, errc
+}
+```
+
+MD5All从c中读取摘要值。如果发生异常，MD5All则提前返回，通过defer语句关闭done：
+
+```go
+func MD5All(root string) (map[string][md5.Size]byte, error) {
+    // 返回时会关闭done；也可能会在没有完全读取c和errc所有数据时提前返回。
+    done := make(chan struct{})
+    defer close(done)
+
+    c, errc := sumFiles(done, root)
+
+    m := make(map[string][md5.Size]byte)
+    for r := range c {
+        if r.err != nil {
+            return nil, r.err
+        }
+        m[r.path] = r.sum
+    }
+    if err := <-errc; err != nil {
+        return nil, err
+    }
+    return m, nil
+}
+```
+
+## 有界并行
