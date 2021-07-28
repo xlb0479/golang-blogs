@@ -253,3 +253,17 @@ func httpDo(ctx context.Context, req *http.Request, f func(*http.Response, error
     }
 }
 ```
+
+## 如何用好Context
+
+很多服务端框架都提供用来携带请求域数据的包和类型。我们可以定义Context接口的新实现，在使用已有框架的代码和需要Context参数的代码之间进行桥接。
+
+比如Gorilla的[github.com/gorilla/context](#http://www.gorillatoolkit.org/pkg/context)包可以让HTTP请求根key-value对映射起来，从而让相关数据和请求进行关联。在[gorilla.go](#https://blog.golang.org/context/gorilla/gorilla.go)中，我们提供了一个Context实现，它的Value方法返回了Gorilla包中特定的HTTP请求所关联的数据。
+
+其它的包还提供了跟Context类似的取消操作。比如[Tomb](#https://godoc.org/gopkg.in/tomb.v2)提供了一个Kill方法，通过关闭Dying香奈儿来发出取消信号。Tomb还提供了用来等待Go协程退出的方法，有点类似于sync.WaitGroup。在[tomb.go](#https://blog.golang.org/context/tomb/tomb.go)中，我们提供了一个Context实现，当它的父级Context被取消，或者一个已知的Tomb被杀死，那么它自身也会被取消。
+
+## 总结一下
+
+在谷歌，对于所有进来的和出去的请求，我们要求Go程序猿都必须要把Context参数作为所有函数的第一个参数。这样不同团队开发的Go代码就可以较好的进行交互了。它还提供了简单的超时和取消机制，并且保证关键数据，比如安全凭据，在Go程序中正确地传递。
+
+服务端框架要想建立在Context上，就需要提供Context实现，在它们自己的包和那些需要Context参数的代码之间做好桥接。客户端库则需要准备好从调用者那里接收一个Context。通过为请求域数据以及取消机制建立通用接口，Context可以让包的开发者更好的提供他们的代码，从而实现扩展性更强的服务。
