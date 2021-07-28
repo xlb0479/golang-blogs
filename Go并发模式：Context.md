@@ -183,3 +183,73 @@ func FromContext(ctx context.Context) (net.IP, bool) {
 
 ## google
 
+[google.Search](#https://blog.golang.org/context/google/google.go)函数调用[谷歌搜索API](#https://developers.google.com/web-search/docs/)，解析返回的JSON。该函数接收一个Context参数ctx，如果ctx.Done被关闭，正在执行的函数会立即返回。
+
+调用谷歌搜索API时传参包括了搜索内容以及用户IP：
+
+```go
+func Search(ctx context.Context, query string) (Results, error) {
+    // 准备请求。
+    req, err := http.NewRequest("GET", "https://ajax.googleapis.com/ajax/services/search/web?v=1.0", nil)
+    if err != nil {
+        return nil, err
+    }
+    q := req.URL.Query()
+    q.Set("q", query)
+
+    // 如果ctx中包含了用户IP，那就转发给谷歌。谷歌的接口会根据用户IP来区分请求是终端用户发起的还是服务端内部发起的。
+    if userIP, ok := userip.FromContext(ctx); ok {
+        q.Set("userip", userIP.String())
+    }
+    req.URL.RawQuery = q.Encode()
+```
+
+Search中定义了一个辅助函数httpDo，负责发起HTTP请求并且在请求处理过程中遇到ctx.Done被关闭时进行取消操作。Search给httpDo传了一个闭包来处理HTTP的响应结果：
+
+```go
+    var results Results
+    err = httpDo(ctx, req, func(resp *http.Response, err error) error {
+        if err != nil {
+            return err
+        }
+        defer resp.Body.Close()
+
+        // 解析JSON。
+        // https://developers.google.com/web-search/docs/#fonje
+        var data struct {
+            ResponseData struct {
+                Results []struct {
+                    TitleNoFormatting string
+                    URL               string
+                }
+            }
+        }
+        if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+            return err
+        }
+        for _, res := range data.ResponseData.Results {
+            results = append(results, Result{Title: res.TitleNoFormatting, URL: res.URL})
+        }
+        return nil
+    })
+    // httpDo会等待我们传入的闭包返回，所以这里可以安全的返回结果。
+    return results, err
+```
+
+httpDo函数执行HTTP请求，然后在一个新的Go协程中处理返回结果。如果Go协程退出之前ctx.Done被关闭，则取消该次请求：
+
+```go
+func httpDo(ctx context.Context, req *http.Request, f func(*http.Response, error) error) error {
+    // 起一个Go协程来执行HTTP请求，并将响应传给f。
+    c := make(chan error, 1)
+    req = req.WithContext(ctx)
+    go func() { c <- f(http.DefaultClient.Do(req)) }()
+    select {
+    case <-ctx.Done():
+        <-c // 等f返回。
+        return ctx.Err()
+    case err := <-c:
+        return err
+    }
+}
+```
