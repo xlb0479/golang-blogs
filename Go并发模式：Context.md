@@ -84,3 +84,102 @@ func WithValue(parent Context, key interface{}, val interface{}) Context
 
 ## server
 
+[server](#https://blog.golang.org/context/server/server.go)程序提供/search?q=golang这种接口，然后返回谷歌搜索golang的前几条结果。它注册了handleSearch来处理/search接口。处理器创建了一个初始的Context，名为ctx，并让它在处理器返回的时候关闭。如果请求参数包含timeout，当超时时间到达时Context自动取消：
+
+```go
+func handleSearch(w http.ResponseWriter, req *http.Request) {
+    // ctx是该处理器的Context。调用cancel可以关闭ctx.Done，也就是给所有由该处理器发起的请求发出了取消信号。
+    var (
+        ctx    context.Context
+        cancel context.CancelFunc
+    )
+    timeout, err := time.ParseDuration(req.FormValue("timeout"))
+    if err == nil {
+        // 请求包含超时参数，创建自带超时光环的Context。
+        ctx, cancel = context.WithTimeout(context.Background(), timeout)
+    } else {
+        ctx, cancel = context.WithCancel(context.Background())
+    }
+    defer cancel() // handleSearch返回时取消ctx。
+```
+
+通过调用userip包，处理器可以从请求中提取出客户端的IP地址。后续请求会用到这个客户端IP，所以handleSearch把它放到了ctx中：
+
+```go
+    // 校验搜索参数。
+    query := req.FormValue("q")
+    if query == "" {
+        http.Error(w, "no query", http.StatusBadRequest)
+        return
+    }
+
+    // 将用户IP保存到ctx，其它包里的代码就能继续用了。
+    userIP, err := userip.FromRequest(req)
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusBadRequest)
+        return
+    }
+    ctx = userip.NewContext(ctx, userIP)
+```
+
+处理器调用google.Search，传入ctx和query：
+
+```go
+    // 执行谷歌搜索并打印结果。
+    start := time.Now()
+    results, err := google.Search(ctx, query)
+    elapsed := time.Since(start)
+```
+
+如果搜索成功，处理器要渲染结果：
+
+```go
+    if err := resultsTemplate.Execute(w, struct {
+        Results          google.Results
+        Timeout, Elapsed time.Duration
+    }{
+        Results: results,
+        Timeout: timeout,
+        Elapsed: elapsed,
+    }); err != nil {
+        log.Print(err)
+        return
+    }
+```
+
+## userip
+
+[userip](#https://blog.golang.org/context/userip/userip.go)包可以从请求中提取出客户端IP，然后还能关联到Context上。Context提供了key-value映射，key和value的类型都是interface{}。key的类型必须要支持相等判断，value则必须要支持可以同时被多个Go协程使用。像userip这种包，它会把这些映射关系隐藏起来，并且要求使用强类型来访问指定的Context的value。
+
+为了避免key冲突，userip中定义了一个未导出的key类型，然后用这种类型的值作为Context中的key。
+
+```go
+// key类型未导出，避免和其它包中的key冲突。
+type key int
+
+// userIPkey就是用户IP在Context中的key。随便给它赋了个零。如果此包中还要定义其他key，那就要给不同的整数值了。
+const userIPKey key = 0
+```
+
+FromRequest从http.Request中提取出userIP：
+
+```go
+func FromRequest(req *http.Request) (net.IP, error) {
+    ip, _, err := net.SplitHostPort(req.RemoteAddr)
+    if err != nil {
+        return nil, fmt.Errorf("userip: %q is not IP:port", req.RemoteAddr)
+    }
+```
+
+FromContext可以从Context中提取出userIP：
+
+```go
+func FromContext(ctx context.Context) (net.IP, bool) {
+    // 如果没有key对应的值，ctx.Value返回nil；如果返回nil，则net.IP的类型断言结果为ok=false。
+    userIP, ok := ctx.Value(userIPKey).(net.IP)
+    return userIP, ok
+}
+```
+
+## google
+
